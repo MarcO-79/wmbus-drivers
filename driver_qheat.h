@@ -17,18 +17,27 @@ struct Qheat : Driver
     std::map<std::string, double> ret_val{};
 
     auto current_gj = this->get_current_hca(telegram);
-    auto last_month_gj = this->get_last_month_hca(telegram);
+    auto last_month_state_gj = this->get_last_month_state(telegram);
 
-    // 1. Aktualne zużycie całkowite (GJ) -> 1.1176 GJ
+    // 1. Aktualne zużycie całkowite (GJ) -> 1.1176 GJ (z obu ramek)
     add_to_map(ret_val, "total_energy_consumption_gj", current_gj);
 
-    // 2. Zużycie na koniec poprzedniego miesiąca (GJ) -> 0.7182 GJ
-    add_to_map(ret_val, "previous_heating_kwh", last_month_gj);
+    // 2. Stan licznika na koniec poprzedniego miesiąca (GJ) -> 0.7182 GJ (z obu ramek)
+    add_to_map(ret_val, "previous_heating_kwh", last_month_state_gj);
 
-    // 3. Zużycie w bieżącym miesiącu (GJ) -> 1.1176 - 0.7182 = 0.3994 GJ
-    if (current_gj.has_value() && last_month_gj.has_value() && current_gj.value() >= last_month_gj.value()) {
-      add_to_map(ret_val, "current_heating_kwh", esphome::optional<double>(current_gj.value() - last_month_gj.value()));
+    // 3. Zużycie w bieżącym miesiącu (GJ) -> 0.3994 GJ (z obu ramek)
+    if (current_gj.has_value() && last_month_state_gj.has_value() && current_gj.value() >= last_month_state_gj.value()) {
+      add_to_map(ret_val, "current_heating_kwh", esphome::optional<double>(current_gj.value() - last_month_state_gj.value()));
     }
+
+    // 4. Zużycie netto w poprzednim miesiącu (Październik: 0.6412 GJ) -> z tabeli 12 m-cy w ramce 89B
+    add_to_map(ret_val, "last_month_total_water_m3", this->get_history_month_delta(telegram, 12));
+
+    // 5. Zużycie netto 2 miesiące temu (Wrzesień: 0.0770 GJ) -> z tabeli 12 m-cy w ramce 89B
+    add_to_map(ret_val, "current_month_total_water_l", this->get_history_month_delta(telegram, 11));
+
+    // 6. Kod błędu urządzenia (02 FD 17 XX XX) -> 0 (z obu ramek)
+    add_to_map(ret_val, "total_water_m3", this->get_error_flags(telegram));
 
     if (ret_val.size() > 0) {
       return ret_val;
@@ -47,9 +56,9 @@ private:
     return true;
   }
 
-  // Odczyt aktualnego zużycia (GJ)
+  // 1. Aktualne zużycie całkowite (GJ)
   esphome::optional<double> get_current_hca(std::vector<unsigned char> &telegram) {
-    // 1. Ramka długa (89 bajtów): po sekwencji C0 0D FF FF (4 bajty BCD)
+    // Ramka 89B: po C0 0D FF FF
     for (size_t i = 20; i + 8 < telegram.size(); i++) {
       if (telegram[i] == 0xC0 && telegram[i+1] == 0x0D && telegram[i+2] == 0xFF && telegram[i+3] == 0xFF) {
         if (is_valid_bcd4(telegram, i + 4)) {
@@ -57,7 +66,7 @@ private:
         }
       }
     }
-    // 2. Ramka standardowa (66 bajtów): po sekwencji 0C 0D (4 bajty BCD)
+    // Ramka 66B: po 0C 0D
     for (size_t i = 18; i + 6 < telegram.size(); i++) {
       if (telegram[i] == 0x0C && telegram[i+1] == 0x0D) {
         if (is_valid_bcd4(telegram, i + 2)) {
@@ -68,9 +77,9 @@ private:
     return {};
   }
 
-  // Odczyt zużycia na koniec poprzedniego miesiąca (GJ)
-  esphome::optional<double> get_last_month_hca(std::vector<unsigned char> &telegram) {
-    // 1. Ramka długa (89 bajtów): 16 bajtów za początkiem C0 0D FF FF -> 82 71 00 00 (0.7182 GJ)
+  // 2. Stan licznika na koniec poprzedniego miesiąca (GJ)
+  esphome::optional<double> get_last_month_state(std::vector<unsigned char> &telegram) {
+    // Ramka 89B: 16 bajtów za C0 0D FF FF (82 71 00 00 -> 0.7182 GJ)
     for (size_t i = 20; i + 20 < telegram.size(); i++) {
       if (telegram[i] == 0xC0 && telegram[i+1] == 0x0D && telegram[i+2] == 0xFF && telegram[i+3] == 0xFF) {
         if (is_valid_bcd4(telegram, i + 16)) {
@@ -78,12 +87,41 @@ private:
         }
       }
     }
-    // 2. Ramka standardowa (66 bajtów): po sekwencji CC 08 0D (Storage 17, 4 bajty BCD) -> 82 71 00 00 (0.7182 GJ)
+    // Ramka 66B: po CC 08 0D (82 71 00 00 -> 0.7182 GJ)
     for (size_t i = 18; i + 7 < telegram.size(); i++) {
       if (telegram[i] == 0xCC && telegram[i+1] == 0x08 && telegram[i+2] == 0x0D) {
         if (is_valid_bcd4(telegram, i + 3)) {
           return (double)bcd_2_int(telegram, i + 3, 4) / 10000.0;
         }
+      }
+    }
+    return {};
+  }
+
+  // 4 & 5. Zużycie miesięczne z 12-miesięcznej tabeli historii w ramce 89B (slot_1_to_12: 12 = poprz. miesiąc, 11 = 2 m-ce temu)
+  esphome::optional<double> get_history_month_delta(std::vector<unsigned char> &telegram, size_t slot_1_to_12) {
+    if (slot_1_to_12 < 1 || slot_1_to_12 > 12) return {};
+    for (size_t i = 20; i + 44 < telegram.size(); i++) {
+      if (telegram[i] == 0xC0 && telegram[i+1] == 0x0D && telegram[i+2] == 0xFF && telegram[i+3] == 0xFF) {
+        // Tabela 12 slotów po 2 bajty (uint16_t Little Endian) zaczyna się 20 bajtów za początkiem C0 0D FF FF
+        size_t pos = i + 20 + (slot_1_to_12 - 1) * 2;
+        if (pos + 1 < telegram.size()) {
+          uint16_t val = (telegram[pos + 1] << 8) | telegram[pos];
+          if (val != 0x8000) { // 0x8000 oznacza pusty slot (brak odczytu w danym miesiącu)
+            return (double)val / 10000.0;
+          }
+        }
+      }
+    }
+    return {};
+  }
+
+  // 6. Kod błędu (02 FD 17 XX XX)
+  esphome::optional<double> get_error_flags(std::vector<unsigned char> &telegram) {
+    for (size_t i = 20; i + 4 < telegram.size(); i++) {
+      if (telegram[i] == 0x02 && telegram[i+1] == 0xFD && telegram[i+2] == 0x17) {
+        uint16_t err = (telegram[i + 4] << 8) | telegram[i + 3];
+        return (double)err;
       }
     }
     return {};
