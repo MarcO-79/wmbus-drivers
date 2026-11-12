@@ -12,25 +12,30 @@
 struct Qheat : Driver
 {
   Qheat(std::string key = "") : Driver(std::string("qheat"), key){};
-  
+
   virtual esphome::optional<std::map<std::string, double>> get_values(std::vector<unsigned char> &telegram) override {
     std::map<std::string, double> ret_val{};
 
-    // 1. Aktualne zużycie energii (GJ)
-    add_to_map(ret_val, "total_energy_consumption_gj", this->get_current_energy(telegram));
-    
-    // 2. Zużycie historyczne - poprzedni okres / miesiąc (GJ)
-    add_to_map(ret_val, "previous_energy_consumption_gj", this->get_previous_energy(telegram));
-    
-    // 3. Całkowita objętość przepływu (m3)
-    add_to_map(ret_val, "total_volume_m3", this->get_volume(telegram));
+    auto current_gj = this->get_current_hca(telegram);
+    auto last_month_gj = this->get_last_month_hca(telegram);
 
-    // 4. Temperatury zasilania i powrotu (°C)
+    // 1. Aktualne zużycie (GJ) -> w Twojej ramce: 1.1175 GJ
+    add_to_map(ret_val, "total_energy_consumption_gj", current_gj);
+
+    // 2. Zużycie na koniec poprzedniego miesiąca (GJ) -> w Twojej ramce (31.10.2026): 0.7182 GJ
+    add_to_map(ret_val, "last_month_energy_gj", last_month_gj);
+
+    // 3. Zużycie w bieżącym miesiącu (różnica: aktualne - koniec poprz. miesiąca) -> 0.3993 GJ
+    if (current_gj.has_value() && last_month_gj.has_value() && current_gj.value() >= last_month_gj.value()) {
+      add_to_map(ret_val, "current_month_energy_gj", esphome::optional<double>(current_gj.value() - last_month_gj.value()));
+    }
+
+    // 4. Flagi błędów (02 FD 17 XX XX) -> w Twojej ramce: 0
+    add_to_map(ret_val, "error_flags", this->get_error_flags(telegram));
+
+    // 5. Pola z ramki 66-bajtowej (jeśli się pojawią)
     add_to_map(ret_val, "flow_temperature_c", this->get_temperature(telegram, 0x5A));
     add_to_map(ret_val, "return_temperature_c", this->get_temperature(telegram, 0x5E));
-
-    // 5. Moc chwilowa (kW)
-    add_to_map(ret_val, "current_power_kw", this->get_power(telegram));
 
     if (ret_val.size() > 0) {
       return ret_val;
@@ -41,34 +46,36 @@ struct Qheat : Driver
   };
 
 private:
-  // Walidacja N bajtów BCD
-  bool is_valid_bcd(std::vector<unsigned char> &t, size_t idx, size_t len) {
-    if (idx + len - 1 >= t.size()) return false;
-    for (size_t k = 0; k < len; k++) {
+  bool is_valid_bcd4(std::vector<unsigned char> &t, size_t idx) {
+    if (idx + 3 >= t.size()) return false;
+    for (size_t k = 0; k < 4; k++) {
       if (((t[idx + k] >> 4) > 9) || ((t[idx + k] & 0x0F) > 9)) return false;
     }
     return true;
   }
 
-  // Odczyt 16-bitowego inta (Little Endian) dla rejestrów binarnych (DIF 0x02)
-  int16_t get_int16_le(std::vector<unsigned char> &t, size_t idx) {
-    return (int16_t)((t[idx + 1] << 8) | t[idx]);
+  bool is_valid_bcd2(std::vector<unsigned char> &t, size_t idx) {
+    if (idx + 1 >= t.size()) return false;
+    for (size_t k = 0; k < 2; k++) {
+      if (((t[idx + k] >> 4) > 9) || ((t[idx + k] & 0x0F) > 9)) return false;
+    }
+    return true;
   }
 
-  // --- Aktualna energia (GJ) ---
-  esphome::optional<double> get_current_energy(std::vector<unsigned char> &telegram) {
-    // 1. Ramka długa (89 bajtów): po sekwencji C0 0D FF FF
+  // Aktualne zużycie (GJ)
+  esphome::optional<double> get_current_hca(std::vector<unsigned char> &telegram) {
+    // 1. Ramka długa (89 bajtów): po C0 0D FF FF (offset +4) -> 75 11 01 00 = 1.1175 GJ
     for (size_t i = 20; i + 8 < telegram.size(); i++) {
       if (telegram[i] == 0xC0 && telegram[i+1] == 0x0D && telegram[i+2] == 0xFF && telegram[i+3] == 0xFF) {
-        if (is_valid_bcd(telegram, i + 4, 4)) {
+        if (is_valid_bcd4(telegram, i + 4)) {
           return (double)bcd_2_int(telegram, i + 4, 4) / 10000.0;
         }
       }
     }
-    // 2. Ramka standardowa (66 bajtów): po sekwencji 0C 0D
+    // 2. Ramka standardowa (66 bajtów): po 0C 0D
     for (size_t i = 18; i + 6 < telegram.size(); i++) {
       if (telegram[i] == 0x0C && telegram[i+1] == 0x0D) {
-        if (is_valid_bcd(telegram, i + 2, 4)) {
+        if (is_valid_bcd4(telegram, i + 2)) {
           return (double)bcd_2_int(telegram, i + 2, 4) / 10000.0;
         }
       }
@@ -76,71 +83,46 @@ private:
     return {};
   }
 
-  // --- Energia historyczna - Storage 1 (GJ) ---
-  esphome::optional<double> get_previous_energy(std::vector<unsigned char> &telegram) {
+  // Zużycie na koniec poprzedniego miesiąca (GJ)
+  esphome::optional<double> get_last_month_hca(std::vector<unsigned char> &telegram) {
+    // 1. W ramce 89-bajtowej wartość z końca poprzedniego miesiąca leży 16 bajtów za początkiem C0 0D FF FF
+    // Struktura: [C0 0D FF FF] (4B) + [Current BCD] (4B) + [FF FF 00 00 00 00] (6B) + [Date CP16] (2B) + [Last Month BCD] (4B)
+    for (size_t i = 20; i + 20 < telegram.size(); i++) {
+      if (telegram[i] == 0xC0 && telegram[i+1] == 0x0D && telegram[i+2] == 0xFF && telegram[i+3] == 0xFF) {
+        if (is_valid_bcd4(telegram, i + 16)) {
+          return (double)bcd_2_int(telegram, i + 16, 4) / 10000.0;
+        }
+      }
+    }
+    // 2. W ramce 66-bajtowej (jeśli występuje jako standardowe 4C 0D)
     for (size_t i = 18; i + 6 < telegram.size(); i++) {
-      // Standardowy zapis M-Bus: DIF=0x4C (BCD 8 cyfr, Storage 1), VIF=0x0D (GJ * 0.0001)
       if (telegram[i] == 0x4C && telegram[i+1] == 0x0D) {
-        if (is_valid_bcd(telegram, i + 2, 4)) {
+        if (is_valid_bcd4(telegram, i + 2)) {
           return (double)bcd_2_int(telegram, i + 2, 4) / 10000.0;
         }
       }
-      // Alternatywny zapis w niektórych rewizjach Qheat (DIF=0x8C, Storage 2, sub-unit 0x01)
-      if (i + 7 < telegram.size() && telegram[i] == 0x8C && (telegram[i+1] == 0x01 || telegram[i+1] == 0x10) && telegram[i+2] == 0x0D) {
-        if (is_valid_bcd(telegram, i + 3, 4)) {
-          return (double)bcd_2_int(telegram, i + 3, 4) / 10000.0;
-        }
+    }
+    return {};
+  }
+
+  // Flagi błędów (02 FD 17 XX XX)
+  esphome::optional<double> get_error_flags(std::vector<unsigned char> &telegram) {
+    for (size_t i = 20; i + 4 < telegram.size(); i++) {
+      if (telegram[i] == 0x02 && telegram[i+1] == 0xFD && telegram[i+2] == 0x17) {
+        uint16_t err = (telegram[i+4] << 8) | telegram[i+3];
+        return (double)err;
       }
     }
     return {};
   }
 
-  // --- Objętość całkowita (m3) ---
-  esphome::optional<double> get_volume(std::vector<unsigned char> &telegram) {
-    for (size_t i = 18; i + 6 < telegram.size(); i++) {
-      if (telegram[i] == 0x0C) {
-        // VIF 0x13 (0.001 m3), 0x14 (0.01 m3), 0x15 (0.1 m3)
-        if (telegram[i+1] >= 0x13 && telegram[i+1] <= 0x15) {
-          if (is_valid_bcd(telegram, i + 2, 4)) {
-            double divider = (telegram[i+1] == 0x13) ? 1000.0 : ((telegram[i+1] == 0x14) ? 100.0 : 10.0);
-            return (double)bcd_2_int(telegram, i + 2, 4) / divider;
-          }
-        }
-      }
-    }
-    return {};
-  }
-
-  // --- Temperatura zasilania (vif_base = 0x5A) lub powrotu (vif_base = 0x5E) ---
+  // Temperatury dla ramki 66-bajtowej (jeśli występują)
   esphome::optional<double> get_temperature(std::vector<unsigned char> &telegram, unsigned char vif_base) {
-    for (size_t i = 18; i + 4 < telegram.size(); i++) {
-      // Wariant BCD (2 bajty = 4 cyfry BCD, DIF = 0x0A)
+    for (size_t i = 18; i + 3 < telegram.size(); i++) {
       if (telegram[i] == 0x0A && (telegram[i+1] == vif_base || telegram[i+1] == vif_base + 1)) {
-        if (is_valid_bcd(telegram, i + 2, 2)) {
-          double divider = (telegram[i+1] == vif_base) ? 10.0 : 1.0; // 0x5A = 0.1°C, 0x5B = 1°C
+        if (is_valid_bcd2(telegram, i + 2)) {
+          double divider = (telegram[i+1] == vif_base) ? 10.0 : 1.0;
           return (double)bcd_2_int(telegram, i + 2, 2) / divider;
-        }
-      }
-      // Wariant Int16 (2 bajty binarne, DIF = 0x02)
-      if (telegram[i] == 0x02 && (telegram[i+1] == vif_base || telegram[i+1] == vif_base + 1)) {
-        double divider = (telegram[i+1] == vif_base) ? 10.0 : 1.0;
-        int16_t raw = get_int16_le(telegram, i + 2);
-        if (raw > -200 && raw < 1800) { // Filtr sanity-check (-20.0°C do 180.0°C)
-          return (double)raw / divider;
-        }
-      }
-    }
-    return {};
-  }
-
-  // --- Moc chwilowa (kW) ---
-  esphome::optional<double> get_power(std::vector<unsigned char> &telegram) {
-    for (size_t i = 18; i + 5 < telegram.size(); i++) {
-      // DIF 0x0B (3 bajty BCD), VIF 0x2D (100 W = 0.1 kW) lub 0x2B (1 W = 0.001 kW)
-      if (telegram[i] == 0x0B && (telegram[i+1] == 0x2D || telegram[i+1] == 0x2B)) {
-        if (is_valid_bcd(telegram, i + 2, 3)) {
-          double divider = (telegram[i+1] == 0x2D) ? 10.0 : 1000.0;
-          return (double)bcd_2_int(telegram, i + 2, 3) / divider;
         }
       }
     }
