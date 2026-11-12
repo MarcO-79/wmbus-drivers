@@ -19,15 +19,13 @@ struct Qheat : Driver
     auto current_gj = this->get_current_hca(telegram);
     auto last_month_gj = this->get_last_month_hca(telegram);
 
-    // 1. Aktualne zużycie całkowite (GJ) -> np. 1.1175 GJ
+    // 1. Aktualne zużycie całkowite (GJ) -> 1.1176 GJ
     add_to_map(ret_val, "total_energy_consumption_gj", current_gj);
 
-    // 2. Zużycie na koniec poprzedniego miesiąca (GJ) -> np. 0.7182 GJ
-    // Używamy wbudowanego w komponent klucza "previous_heating_kwh" (jednostkę nadpisujemy w YAML na GJ)
+    // 2. Zużycie na koniec poprzedniego miesiąca (GJ) -> 0.7182 GJ
     add_to_map(ret_val, "previous_heating_kwh", last_month_gj);
 
-    // 3. Zużycie w bieżącym miesiącu (GJ) -> wyliczona różnica (np. 1.1175 - 0.7182 = 0.3993 GJ)
-    // Używamy wbudowanego w komponent klucza "current_heating_kwh"
+    // 3. Zużycie w bieżącym miesiącu (GJ) -> 1.1176 - 0.7182 = 0.3994 GJ
     if (current_gj.has_value() && last_month_gj.has_value() && current_gj.value() >= last_month_gj.value()) {
       add_to_map(ret_val, "current_heating_kwh", esphome::optional<double>(current_gj.value() - last_month_gj.value()));
     }
@@ -51,7 +49,7 @@ private:
 
   // Odczyt aktualnego zużycia (GJ)
   esphome::optional<double> get_current_hca(std::vector<unsigned char> &telegram) {
-    // 1. Ramka długa (89 bajtów): wartość leży po sekwencji C0 0D FF FF (4 bajty BCD)
+    // 1. Ramka długa (89 bajtów): po sekwencji C0 0D FF FF (4 bajty BCD)
     for (size_t i = 20; i + 8 < telegram.size(); i++) {
       if (telegram[i] == 0xC0 && telegram[i+1] == 0x0D && telegram[i+2] == 0xFF && telegram[i+3] == 0xFF) {
         if (is_valid_bcd4(telegram, i + 4)) {
@@ -59,7 +57,7 @@ private:
         }
       }
     }
-    // 2. Ramka standardowa (66 bajtów): wartość leży po 0C 0D (4 bajty BCD)
+    // 2. Ramka standardowa (66 bajtów): po sekwencji 0C 0D (4 bajty BCD)
     for (size_t i = 18; i + 6 < telegram.size(); i++) {
       if (telegram[i] == 0x0C && telegram[i+1] == 0x0D) {
         if (is_valid_bcd4(telegram, i + 2)) {
@@ -72,8 +70,7 @@ private:
 
   // Odczyt zużycia na koniec poprzedniego miesiąca (GJ)
   esphome::optional<double> get_last_month_hca(std::vector<unsigned char> &telegram) {
-    // 1. Ramka długa (89 bajtów): wartość z końca poprzedniego miesiąca leży 16 bajtów za początkiem C0 0D FF FF
-    // Układ: [C0 0D FF FF] (4B) + [Current BCD] (4B) + [FF FF 00 00 00 00] (6B) + [Data CP16] (2B) + [Last Month BCD] (4B)
+    // 1. Ramka długa (89 bajtów): 16 bajtów za początkiem C0 0D FF FF -> 82 71 00 00 (0.7182 GJ)
     for (size_t i = 20; i + 20 < telegram.size(); i++) {
       if (telegram[i] == 0xC0 && telegram[i+1] == 0x0D && telegram[i+2] == 0xFF && telegram[i+3] == 0xFF) {
         if (is_valid_bcd4(telegram, i + 16)) {
@@ -81,11 +78,11 @@ private:
         }
       }
     }
-    // 2. Ramka standardowa (66 bajtów): wartość po sekwencji 4C 0D (Storage 1, 4 bajty BCD)
-    for (size_t i = 18; i + 6 < telegram.size(); i++) {
-      if (telegram[i] == 0x4C && telegram[i+1] == 0x0D) {
-        if (is_valid_bcd4(telegram, i + 2)) {
-          return (double)bcd_2_int(telegram, i + 2, 4) / 10000.0;
+    // 2. Ramka standardowa (66 bajtów): po sekwencji CC 08 0D (Storage 17, 4 bajty BCD) -> 82 71 00 00 (0.7182 GJ)
+    for (size_t i = 18; i + 7 < telegram.size(); i++) {
+      if (telegram[i] == 0xCC && telegram[i+1] == 0x08 && telegram[i+2] == 0x0D) {
+        if (is_valid_bcd4(telegram, i + 3)) {
+          return (double)bcd_2_int(telegram, i + 3, 4) / 10000.0;
         }
       }
     }
