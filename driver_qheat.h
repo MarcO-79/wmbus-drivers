@@ -19,23 +19,18 @@ struct Qheat : Driver
     auto current_gj = this->get_current_hca(telegram);
     auto last_month_gj = this->get_last_month_hca(telegram);
 
-    // 1. Aktualne zużycie (GJ) -> w Twojej ramce: 1.1175 GJ
+    // 1. Aktualne zużycie całkowite (GJ) -> np. 1.1175 GJ
     add_to_map(ret_val, "total_energy_consumption_gj", current_gj);
 
-    // 2. Zużycie na koniec poprzedniego miesiąca (GJ) -> w Twojej ramce (31.10.2026): 0.7182 GJ
-    add_to_map(ret_val, "last_month_energy_gj", last_month_gj);
+    // 2. Zużycie na koniec poprzedniego miesiąca (GJ) -> np. 0.7182 GJ
+    // Używamy wbudowanego w komponent klucza "previous_heating_kwh" (jednostkę nadpisujemy w YAML na GJ)
+    add_to_map(ret_val, "previous_heating_kwh", last_month_gj);
 
-    // 3. Zużycie w bieżącym miesiącu (różnica: aktualne - koniec poprz. miesiąca) -> 0.3993 GJ
+    // 3. Zużycie w bieżącym miesiącu (GJ) -> wyliczona różnica (np. 1.1175 - 0.7182 = 0.3993 GJ)
+    // Używamy wbudowanego w komponent klucza "current_heating_kwh"
     if (current_gj.has_value() && last_month_gj.has_value() && current_gj.value() >= last_month_gj.value()) {
-      add_to_map(ret_val, "current_month_energy_gj", esphome::optional<double>(current_gj.value() - last_month_gj.value()));
+      add_to_map(ret_val, "current_heating_kwh", esphome::optional<double>(current_gj.value() - last_month_gj.value()));
     }
-
-    // 4. Flagi błędów (02 FD 17 XX XX) -> w Twojej ramce: 0
-    add_to_map(ret_val, "error_flags", this->get_error_flags(telegram));
-
-    // 5. Pola z ramki 66-bajtowej (jeśli się pojawią)
-    add_to_map(ret_val, "flow_temperature_c", this->get_temperature(telegram, 0x5A));
-    add_to_map(ret_val, "return_temperature_c", this->get_temperature(telegram, 0x5E));
 
     if (ret_val.size() > 0) {
       return ret_val;
@@ -54,17 +49,9 @@ private:
     return true;
   }
 
-  bool is_valid_bcd2(std::vector<unsigned char> &t, size_t idx) {
-    if (idx + 1 >= t.size()) return false;
-    for (size_t k = 0; k < 2; k++) {
-      if (((t[idx + k] >> 4) > 9) || ((t[idx + k] & 0x0F) > 9)) return false;
-    }
-    return true;
-  }
-
-  // Aktualne zużycie (GJ)
+  // Odczyt aktualnego zużycia (GJ)
   esphome::optional<double> get_current_hca(std::vector<unsigned char> &telegram) {
-    // 1. Ramka długa (89 bajtów): po C0 0D FF FF (offset +4) -> 75 11 01 00 = 1.1175 GJ
+    // 1. Ramka długa (89 bajtów): wartość leży po sekwencji C0 0D FF FF (4 bajty BCD)
     for (size_t i = 20; i + 8 < telegram.size(); i++) {
       if (telegram[i] == 0xC0 && telegram[i+1] == 0x0D && telegram[i+2] == 0xFF && telegram[i+3] == 0xFF) {
         if (is_valid_bcd4(telegram, i + 4)) {
@@ -72,7 +59,7 @@ private:
         }
       }
     }
-    // 2. Ramka standardowa (66 bajtów): po 0C 0D
+    // 2. Ramka standardowa (66 bajtów): wartość leży po 0C 0D (4 bajty BCD)
     for (size_t i = 18; i + 6 < telegram.size(); i++) {
       if (telegram[i] == 0x0C && telegram[i+1] == 0x0D) {
         if (is_valid_bcd4(telegram, i + 2)) {
@@ -83,10 +70,10 @@ private:
     return {};
   }
 
-  // Zużycie na koniec poprzedniego miesiąca (GJ)
+  // Odczyt zużycia na koniec poprzedniego miesiąca (GJ)
   esphome::optional<double> get_last_month_hca(std::vector<unsigned char> &telegram) {
-    // 1. W ramce 89-bajtowej wartość z końca poprzedniego miesiąca leży 16 bajtów za początkiem C0 0D FF FF
-    // Struktura: [C0 0D FF FF] (4B) + [Current BCD] (4B) + [FF FF 00 00 00 00] (6B) + [Date CP16] (2B) + [Last Month BCD] (4B)
+    // 1. Ramka długa (89 bajtów): wartość z końca poprzedniego miesiąca leży 16 bajtów za początkiem C0 0D FF FF
+    // Układ: [C0 0D FF FF] (4B) + [Current BCD] (4B) + [FF FF 00 00 00 00] (6B) + [Data CP16] (2B) + [Last Month BCD] (4B)
     for (size_t i = 20; i + 20 < telegram.size(); i++) {
       if (telegram[i] == 0xC0 && telegram[i+1] == 0x0D && telegram[i+2] == 0xFF && telegram[i+3] == 0xFF) {
         if (is_valid_bcd4(telegram, i + 16)) {
@@ -94,35 +81,11 @@ private:
         }
       }
     }
-    // 2. W ramce 66-bajtowej (jeśli występuje jako standardowe 4C 0D)
+    // 2. Ramka standardowa (66 bajtów): wartość po sekwencji 4C 0D (Storage 1, 4 bajty BCD)
     for (size_t i = 18; i + 6 < telegram.size(); i++) {
       if (telegram[i] == 0x4C && telegram[i+1] == 0x0D) {
         if (is_valid_bcd4(telegram, i + 2)) {
           return (double)bcd_2_int(telegram, i + 2, 4) / 10000.0;
-        }
-      }
-    }
-    return {};
-  }
-
-  // Flagi błędów (02 FD 17 XX XX)
-  esphome::optional<double> get_error_flags(std::vector<unsigned char> &telegram) {
-    for (size_t i = 20; i + 4 < telegram.size(); i++) {
-      if (telegram[i] == 0x02 && telegram[i+1] == 0xFD && telegram[i+2] == 0x17) {
-        uint16_t err = (telegram[i+4] << 8) | telegram[i+3];
-        return (double)err;
-      }
-    }
-    return {};
-  }
-
-  // Temperatury dla ramki 66-bajtowej (jeśli występują)
-  esphome::optional<double> get_temperature(std::vector<unsigned char> &telegram, unsigned char vif_base) {
-    for (size_t i = 18; i + 3 < telegram.size(); i++) {
-      if (telegram[i] == 0x0A && (telegram[i+1] == vif_base || telegram[i+1] == vif_base + 1)) {
-        if (is_valid_bcd2(telegram, i + 2)) {
-          double divider = (telegram[i+1] == vif_base) ? 10.0 : 1.0;
-          return (double)bcd_2_int(telegram, i + 2, 2) / divider;
         }
       }
     }
