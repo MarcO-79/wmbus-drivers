@@ -35,20 +35,19 @@ private:
   }
 
   esphome::optional<double> get_current_hca(std::vector<unsigned char> &telegram) {
-    // 1. Ramka długa (89 bajtów): wartość leży zawsze po sekwencji C0 0D FF FF (np. 38 46 00 00 -> 4638)
+    // 1. Ramka długa (89 bajtów): wartość leży zawsze po sekwencji C0 0D FF FF (np. 38 46 00 00 -> 0.4638)
     for (size_t i = 20; i + 8 < telegram.size(); i++) {
       if (telegram[i] == 0xC0 && telegram[i+1] == 0x0D && telegram[i+2] == 0xFF && telegram[i+3] == 0xFF) {
         if (is_valid_bcd4(telegram, i + 4)) {
-          return (double)bcd_2_int(telegram, i + 4, 4);
+          return (double)bcd_2_int(telegram, i + 4, 4) / 10000.0;
         }
       }
     }
     // 2. Ramka standardowa (66 bajtów): wartość leży po 0C 0D, gdzie wszystkie 4 kolejne bajty są poprawnym BCD
-    // (w ramce 89-bajtowej po 0C 0D stoi bajt 0xFF, więc is_valid_bcd4 automatycznie go odrzuci!)
     for (size_t i = 18; i + 6 < telegram.size(); i++) {
       if (telegram[i] == 0x0C && telegram[i+1] == 0x0D) {
         if (is_valid_bcd4(telegram, i + 2)) {
-          return (double)bcd_2_int(telegram, i + 2, 4);
+          return (double)bcd_2_int(telegram, i + 2, 4) / 10000.0;
         }
       }
     }
